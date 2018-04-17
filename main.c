@@ -1,5 +1,8 @@
+#define _ISOC11_SOURCE
+
 #include <stdio.h>
 #include <stdlib.h>
+#include <time.h>
 
 #include <clFFT.h>
 
@@ -7,6 +10,7 @@
 
 #define MAX_SOURCE_SIZE (0x100000)
 #define WORKSIZE 16
+#define NLOOPS 1000
 
 int setWorkSize(size_t *gws, size_t *lws, cl_int x, cl_int y) {
         switch (y) {
@@ -38,6 +42,7 @@ int main(void) {
         cl_command_queue queue = 0;
         cl_mem bufX;
         float *X;
+	float *ampd;
         int ret = 0;
 
         pgm_t ipgm;
@@ -124,33 +129,14 @@ int main(void) {
         /* Allocate host & initialize data. */
         /* Only allocation shown for simplicity. */
         size_t buffer_size = N0 * N1 * 2 * sizeof(*X);
-        X = (float *)malloc(buffer_size);
+	/* Align to 256-bit boundary */
+        X = (float *)aligned_alloc(32, buffer_size);
+	ampd = (float *)aligned_alloc(32, N0 * N1 * sizeof(float));
 
-        /* print input array just using the
-         * indices to fill the array with data */
-        printf("\nPerforming fft on an two dimensional array of size N0 x N1 : "
-               "%lu x "
-               "%lu\n",
-               (unsigned long)N0, (unsigned long)N1);
-        size_t i, j;
-
-        for (i = 0; i < N0; ++i) {
-                for (j = 0; j < N1; ++j) {
-                        float x = ipgm.buf[j + i * N1];
-                        float y = 0.0f;
-                        size_t idx = 2 * (j + i * N1);
-                        X[idx] = x;
-                        X[idx + 1] = y;
-                }
-        }
-
-        /* Prepare OpenCL memory objects and place data inside them. */
+	/* Prepare OpenCL memory objects and place data inside them. */
         bufX = clCreateBuffer(ctx, CL_MEM_READ_WRITE, buffer_size, NULL, &err);
 
-        err = clEnqueueWriteBuffer(queue, bufX, CL_TRUE, 0, buffer_size, X, 0,
-                                   NULL, NULL);
-
-        /* Create a default plan for a complex FFT. */
+	/* Create a default plan for a complex FFT. */
         err = clfftCreateDefaultPlan(&planHandle, ctx, dim, clLengths);
 
         /* Set plan parameters. */
@@ -162,50 +148,87 @@ int main(void) {
         /* Bake the plan. */
         err = clfftBakePlan(planHandle, 1, &queue, NULL, NULL);
 
-        /* Execute the plan. */
-        err = clfftEnqueueTransform(planHandle, CLFFT_FORWARD, 1, &queue, 0,
-                                    NULL, NULL, &bufX, NULL, NULL);
+        /* print input array just using the
+         * indices to fill the array with data */
+        printf("\nPerforming fft on an two dimensional array of size N0 x N1 : "
+               "%lu x "
+               "%lu\n",
+	       (unsigned long)N0, (unsigned long)N1);
 
-        /* Apply high-pass filter */
-        cl_int n = N0;
-        cl_int radius = n / 8;
-        size_t gws[2];
-        size_t lws[2];
-        ret = clSetKernelArg(hpfl, 0, sizeof(cl_mem), (void *)&bufX);
-        ret = clSetKernelArg(hpfl, 1, sizeof(cl_int), (void *)&n);
-        ret = clSetKernelArg(hpfl, 2, sizeof(cl_int), (void *)&radius);
-        setWorkSize(gws, lws, n, n);
-        ret = clEnqueueNDRangeKernel(queue, hpfl, 2, NULL, gws, lws, 0, NULL,
-                                     NULL);
-        if (ret != 0) {
-                fprintf(stderr, "Can't enqueue kernel. Error: %d\n", ret);
-                exit(1);
-        }
+        size_t i, j, k;
+	struct timespec ts1, ts2;
 
-        /* Execute the plan for inverse FFT. */
-        err = clfftEnqueueTransform(planHandle, CLFFT_BACKWARD, 1, &queue, 0,
-                                    NULL, NULL, &bufX, NULL, NULL);
+	clock_gettime(CLOCK_MONOTONIC, &ts1);
 
-        /* Wait for calculations to be finished. */
-        err = clFinish(queue);
+	for (k = 0; k < NLOOPS; k++)
+	{
+		for (i = 0; i < N0; ++i) {
+			for (j = 0; j < N1; ++j) {
+				float x = ipgm.buf[j + i * N1];
+				float y = 0.0f;
+				size_t idx = 2 * (j + i * N1);
+				X[idx] = x;
+				X[idx + 1] = y;
+			}
+		}
 
-        /* Fetch results of calculations. */
-        err = clEnqueueReadBuffer(queue, bufX, CL_TRUE, 0, buffer_size, X, 0,
-                                  NULL, NULL);
+		err = clEnqueueWriteBuffer(queue, bufX, CL_TRUE, 0,
+					   buffer_size, X, 0, NULL, NULL);
 
-        float *ampd;
-        ampd = (float *)malloc(N0 * N1 * sizeof(float));
-        for (i = 0; i < N0; ++i) {
-                for (j = 0; j < N1; ++j) {
-                        size_t idx = 2 * (j + i * N1);
-                        ampd[j + i * N1] =
-                            sqrt(X[idx] * X[idx] + X[idx + 1] * X[idx + 1]);
-                }
-        }
-        opgm.width = N0;
-        opgm.height = N1;
-        normalizeF2PGM(&opgm, ampd);
-        free(ampd);
+		/* Execute the plan. */
+		err = clfftEnqueueTransform(planHandle, CLFFT_FORWARD, 1,
+					    &queue, 0, NULL, NULL, &bufX,
+					    NULL, NULL);
+
+		/* Apply high-pass filter */
+		cl_int n = N0;
+		cl_int radius = n / 8;
+		size_t gws[2];
+		size_t lws[2];
+		ret = clSetKernelArg(hpfl, 0, sizeof(cl_mem), (void *)&bufX);
+		ret = clSetKernelArg(hpfl, 1, sizeof(cl_int), (void *)&n);
+		ret = clSetKernelArg(hpfl, 2, sizeof(cl_int), (void *)&radius);
+		setWorkSize(gws, lws, n, n);
+		ret = clEnqueueNDRangeKernel(queue, hpfl, 2, NULL, gws, lws, 0,
+					     NULL, NULL);
+		if (ret != 0) {
+			fprintf(stderr, "Can't enqueue kernel. Error: %d\n",
+				ret);
+			exit(1);
+		}
+
+		/* Execute the plan for inverse FFT. */
+		err = clfftEnqueueTransform(planHandle, CLFFT_BACKWARD, 1,
+					    &queue, 0, NULL, NULL, &bufX,
+					    NULL, NULL);
+
+		/* Wait for calculations to be finished. */
+		err = clFinish(queue);
+
+		/* Fetch results of calculations. */
+		err = clEnqueueReadBuffer(queue, bufX, CL_TRUE, 0, buffer_size,
+					  X, 0, NULL, NULL);
+
+		for (i = 0; i < N0; ++i) {
+			for (j = 0; j < N1; ++j) {
+				size_t idx = 2 * (j + i * N1);
+				ampd[j + i * N1] =
+				    sqrt(X[idx] * X[idx] +
+					 X[idx + 1] * X[idx + 1]);
+			}
+		}
+		opgm.width = N0;
+		opgm.height = N1;
+		normalizeF2PGM(&opgm, ampd);
+	}
+
+	clock_gettime(CLOCK_MONOTONIC, &ts2);
+	ts2.tv_sec -= ts1.tv_sec;
+	ts1.tv_sec = 0;
+	double t1 = ts1.tv_sec + (double) ts1.tv_nsec * 1.0e-9;
+	double t2 = ts2.tv_sec + (double) ts2.tv_nsec * 1.0e-9;
+	printf("iteration executed in %f ms\n", (t2 - t1) * 1000.0 / NLOOPS);
+
         writePGM(&opgm, "output.pgm");
 	destroyPGM(&ipgm);
 	destroyPGM(&opgm);
@@ -213,6 +236,7 @@ int main(void) {
         /* Release OpenCL memory objects. */
         clReleaseMemObject(bufX);
 
+	free(ampd);
         free(X);
 
         /* Release the plan. */
